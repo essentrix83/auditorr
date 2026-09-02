@@ -6,6 +6,7 @@ import time
 import unicodedata
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger(__name__)
@@ -1297,6 +1298,8 @@ def fetch_arr_all_titles(cfg, force=False):
                         'title_slug':    m.get('titleSlug') or '',
                         'year':          m.get('year'),
                         'has_file':      bool(m.get('hasFile')),
+                        'tmdb_id':       m.get('tmdbId'),
+                        'tvdb_id':       m.get('tvdbId'),
                     })
             else:
                 for s in _arr_get(conn['base_url'], conn['api_key'], '/api/v3/series'):
@@ -1309,12 +1312,137 @@ def fetch_arr_all_titles(cfg, force=False):
                         'title_slug':    s.get('titleSlug') or '',
                         'year':          s.get('year'),
                         'has_file':      (stats.get('episodeFileCount') or 0) > 0,
+                        'tmdb_id':       s.get('tmdbId'),
+                        'tvdb_id':       s.get('tvdbId'),
                     })
         except Exception as e:
             log.warning("Could not fetch %s titles from %s: %s", conn['service'], conn['id'], e)
     _arr_titles_cache['data'] = rows
     _arr_titles_cache['ts'] = now
     return rows
+
+
+def get_arr_item(cfg, service, connection_id, arr_id):
+    """Fetch one exact, live Arr item by configured connection and ID.
+
+    Decommission intentionally works from IDs rather than a parsed title, so a
+    remake or a similarly-named series can never be removed by fuzzy matching.
+    Returns ``(connection, item)`` or raises ValueError for an invalid target.
+    """
+    service = str(service or '').lower()
+    if service not in _SERVICE_MAP:
+        raise ValueError('service must be sonarr or radarr')
+    try:
+        arr_id = int(arr_id)
+    except (TypeError, ValueError):
+        raise ValueError('arr_id must be an integer')
+    connection_id = str(connection_id or '').strip()
+    if not connection_id:
+        raise ValueError('connection_id is required')
+    conn = next((c for c in normalize_arr_connections(cfg, service=service)
+                 if str(c['id']) == connection_id), None)
+    if conn is None:
+        raise ValueError('Configured Arr connection was not found')
+    endpoint = '/api/v3/movie/' if service == 'radarr' else '/api/v3/series/'
+    try:
+        item = _arr_get(conn['base_url'], conn['api_key'], f'{endpoint}{arr_id}', timeout=20)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError('Arr item no longer exists') from e
+        raise
+    if not isinstance(item, dict) or item.get('id') != arr_id:
+        raise ValueError('Arr returned an unexpected item')
+    return conn, item
+
+
+def _arr_write(conn, method, path, *, body=None, params=None, timeout=30):
+    """Send a JSON write to one normalized Arr connection."""
+    query = '?' + urllib.parse.urlencode(params) if params else ''
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    headers = {'X-Api-Key': conn['api_key']}
+    if data is not None:
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(
+        conn['base_url'].rstrip('/') + path + query,
+        data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode('utf-8')) if raw else None
+
+
+def delete_arr_item(conn, service, item, *, delete_files=False):
+    """Remove an already-confirmed Arr item using its exact live ID.
+
+    ``delete_files`` is false by default.  The Decommission workflow begins
+    after an external library deletion, so deleting any remaining extras needs
+    a separate, explicit acknowledgement in the UI.
+    """
+    service = str(service or '').lower()
+    if service not in _SERVICE_MAP:
+        raise ValueError('service must be sonarr or radarr')
+    try:
+        arr_id = int(item.get('id'))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError('Live Arr item has no valid ID')
+    if service == 'radarr':
+        params = {
+            'deleteFiles': 'true' if delete_files else 'false',
+            'addImportExclusion': 'false',
+        }
+        path = f'/api/v3/movie/{arr_id}'
+    else:
+        params = {
+            'deleteFiles': 'true' if delete_files else 'false',
+            'addImportListExclusion': 'false',
+        }
+        path = f'/api/v3/series/{arr_id}'
+    try:
+        _arr_write(conn, 'DELETE', path, params=params)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError('Arr item no longer exists') from e
+        raise
+    return item
+
+
+def set_arr_item_unmonitored(conn, service, item):
+    """Keep an exact live Arr item but turn monitoring off."""
+    service = str(service or '').lower()
+    if service not in _SERVICE_MAP:
+        raise ValueError('service must be sonarr or radarr')
+    try:
+        arr_id = int(item.get('id'))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError('Live Arr item has no valid ID')
+    updated = dict(item)
+    updated['monitored'] = False
+    path = f'/api/v3/movie/{arr_id}' if service == 'radarr' else f'/api/v3/series/{arr_id}'
+    _arr_write(conn, 'PUT', path, body=updated)
+    return updated
+
+
+def add_arr_import_exclusion(conn, service, item):
+    """Add one exact live item to the service's import-list exclusion table."""
+    service = str(service or '').lower()
+    if service == 'radarr':
+        tmdb_id = item.get('tmdbId')
+        if not tmdb_id:
+            raise ValueError('Live Radarr item has no TMDb ID for an import exclusion')
+        path = '/api/v3/exclusions'
+        body = {
+            'tmdbId': int(tmdb_id),
+            'movieTitle': item.get('title') or '',
+            'movieYear': int(item.get('year') or 0),
+        }
+    elif service == 'sonarr':
+        tvdb_id = item.get('tvdbId')
+        if not tvdb_id:
+            raise ValueError('Live Sonarr item has no TVDb ID for an import-list exclusion')
+        path = '/api/v3/importlistexclusion'
+        body = {'tvdbId': int(tvdb_id), 'title': item.get('title') or ''}
+    else:
+        raise ValueError('service must be sonarr or radarr')
+    return _arr_write(conn, 'POST', path, body=body)
 
 
 def _detect_hdr(title):

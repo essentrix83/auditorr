@@ -29,10 +29,16 @@ def set_state(**kwargs):
         audit_state.update(kwargs)
 
 
-def update_progress(scanned, total):
+def update_progress(scanned, total=None):
+    """Update scan progress without inventing a percentage when total is unknown."""
     with _state_lock:
         audit_state["scanned_files"] = scanned
-        audit_state["progress"] = min(100, int((scanned / total) * 100)) if total > 0 else 0
+        if total is None:
+            audit_state["total_files"] = 0
+            audit_state["progress"] = None
+        else:
+            audit_state["total_files"] = total
+            audit_state["progress"] = min(100, int((scanned / total) * 100)) if total > 0 else 0
 
 
 def try_start_scanning(trigger):

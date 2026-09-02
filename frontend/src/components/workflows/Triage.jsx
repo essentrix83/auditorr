@@ -10,6 +10,10 @@ import {
 
 const VERDICTS = [
   {
+    key: 'tracker_unverified', label: 'Tracker Unverified — hold', color: 'var(--yellow)',
+    desc: 'The tracker is unreachable, reporting an error, or Auditorr could not get a definitive answer. This imported torrent is held and cannot be removed until verification is conclusive.',
+  },
+  {
     key: 'dead_seed', label: 'Dead Seeds — imported', color: 'var(--green)',
     desc: 'Tracker-dead (trumped, deleted, or nuked) but already imported: your library holds a hardlink to the same data, so deleting these via the client is completely lossless. The safest cleanup there is.',
   },
@@ -518,7 +522,7 @@ export default function Triage({ onNavigate, cleanupCount }) {
 
   // Items deletable through the client need a torrent hash; path-keyed
   // entries (hash unknown) can only be handled manually.
-  const deletableItems = selectedItems.filter(i => i.hash)
+  const deletableItems = selectedItems.filter(i => i.hash && i.verdict !== 'tracker_unverified')
 
   // Superseded items are the only ones a force import applies to — the rest
   // have no library file to replace. Of those, only same-quality ones qualify;

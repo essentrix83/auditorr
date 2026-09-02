@@ -141,7 +141,11 @@ def _walk_directory(base_path, source_label, inode_map, qbit_file_map, scanned_s
                 total_ref[0] += 1
                 if total_ref[0] % 500 == 0:
                     set_state(total_files=total_ref[0])
-            update_progress(scanned, total_ref[0] if total_ref is not None else total_files)
+                # Count is discovered while walking — percentage would be
+                # self-referential and jump to 100% before the scan ends.
+                update_progress(scanned)
+            else:
+                update_progress(scanned, total_files)
     return key_order, scanned, stat_errors
 
 

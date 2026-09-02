@@ -33,6 +33,11 @@ DEFAULT_CONFIG = {
     'OR_RATIO':           0.01,
     'NI_RATIO':           0.01,
     'DUP_RATIO':          0.01,
+    # Display/accounting aliases only. They consolidate equivalent announce
+    # hostnames; raw tracker URLs remain untouched in the torrent client.
+    'TRACKER_HOST_ALIASES': {
+        'tracker.tleechreload.org': 'tracker.torrentleech.org',
+    },
     # Relative importance of each score component. Normalized to 100 points at
     # scoring time, so any non-negative numbers are valid — the defaults happen
     # to sum to 100 already, which keeps them readable as point values.
@@ -193,6 +198,12 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS decommission_actions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ran_at      TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_decommission_ran_at ON decommission_actions(ran_at);
         ''')
         conn.commit()
         # Migrations: add columns that didn't exist in earlier schema versions
@@ -529,6 +540,23 @@ def db_delete_meta(key):
     conn = _db_conn()
     try:
         conn.execute('DELETE FROM app_meta WHERE key = ?', (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_save_decommission_action(detail):
+    """Keep an append-only record of a confirmed decommission plan/result.
+
+    The saved live arr payload is intentionally included: it is useful recovery
+    evidence if an operator later needs to recreate a removed title.
+    """
+    conn = _db_conn()
+    try:
+        conn.execute(
+            'INSERT INTO decommission_actions (ran_at, detail_json) VALUES (?, ?)',
+            (datetime.now().isoformat(), json.dumps(detail)),
+        )
         conn.commit()
     finally:
         conn.close()

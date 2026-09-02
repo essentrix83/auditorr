@@ -109,6 +109,7 @@ export default function ScanProgress({ isScanning, progress, phase, statusMessag
 
   if (!visible || dismissed) return null
 
+  const progressKnown = Number.isFinite(progress)
   const torrentsDone = phase === 'disk' || phase === 'post' || phase === 'idle'
   const torrentsActive = phase === 'connecting' || phase === 'torrents'
   const torrentsPulse = torrentsActive && progress === 0
@@ -116,7 +117,7 @@ export default function ScanProgress({ isScanning, progress, phase, statusMessag
 
   const diskDone = phase === 'post' || phase === 'idle'
   const diskActive = phase === 'disk'
-  const diskFill = diskDone ? 100 : diskActive ? progress : 0
+  const diskFill = diskDone ? 100 : diskActive ? (progressKnown ? progress : 40) : 0
 
   const torrentsStatus = phase === 'connecting' ? 'connecting…'
     : phase === 'torrents' ? 'fetching torrent list…'
@@ -148,7 +149,7 @@ export default function ScanProgress({ isScanning, progress, phase, statusMessag
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>Scanning library…</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--accent)' }}>{progress}%</span>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--accent)' }}>{progressKnown ? `${progress}%` : 'working…'}</span>
                 <button
                   onClick={() => setDismissed(true)}
                   title="Dismiss"
@@ -161,12 +162,14 @@ export default function ScanProgress({ isScanning, progress, phase, statusMessag
 
             {/* Phase bars */}
             <PhaseBar label="Torrents" fillPct={torrentsFill} pulse={torrentsPulse} phaseStatus={torrentsStatus} />
-            <PhaseBar label="Disk" fillPct={diskFill} pulse={false} phaseStatus={diskStatus} />
+            <PhaseBar label="Disk" fillPct={diskFill} pulse={diskActive && !progressKnown} phaseStatus={diskStatus} />
 
             {/* File counter */}
-            {totalFiles > 0 && (
+            {scannedFiles > 0 && (
               <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)', textAlign: 'right' }}>
-                {scannedFiles.toLocaleString()} / {totalFiles.toLocaleString()} files
+                {totalFiles > 0
+                  ? `${scannedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
+                  : `${scannedFiles.toLocaleString()} files scanned`}
               </div>
             )}
 

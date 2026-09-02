@@ -43,7 +43,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 
 import requests
 
-from sources import SourceConnectionError, classify_tracker_entries, HEALTH_RANK as _HEALTH_RANK
+from sources import (SourceConnectionError, canonical_tracker_hosts,
+                     classify_tracker_entries, HEALTH_RANK as _HEALTH_RANK)
 
 log = logging.getLogger(__name__)
 
@@ -251,7 +252,7 @@ def _fetch_torrent_data(session, base, inst_id, torrent_hash):
     return hosts, health, files
 
 
-def _process_instance(session, base, inst, remote_path, local_path,
+def _process_instance(session, base, inst, remote_path, local_path, cfg,
                       file_map, trackers_set, tracker_upload, tracker_seeding_size,
                       seen_hashes):
     inst_id   = inst['id']
@@ -268,6 +269,7 @@ def _process_instance(session, base, inst, remote_path, local_path,
         if not th:
             return th, ['Unknown'], ('unknown', ''), []
         hosts, health, files = _fetch_torrent_data(session, base, inst_id, th)
+        hosts = canonical_tracker_hosts(cfg, hosts)
         return th, hosts, health, files
 
     # Per-torrent file/tracker fetch — bounded total timeout so a single
@@ -495,7 +497,7 @@ def _fetch_inner(cfg):
 
     for inst in eligible:
         try:
-            _process_instance(sess, base, inst, remote_path, local_path,
+            _process_instance(sess, base, inst, remote_path, local_path, cfg,
                                file_map, trackers_set, tracker_upload, tracker_seeding_size,
                                seen_hashes)
         except Exception as e:

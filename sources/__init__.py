@@ -18,6 +18,30 @@ class SourceConnectionError(Exception):
     """Raised by backends when they cannot connect or authenticate."""
 
 
+def canonical_tracker_hosts(cfg, hosts):
+    """Return unique display/accounting hosts after configured alias folding.
+
+    This affects Auditorr statistics only.  It never writes to a torrent
+    client, and deliberately leaves per-torrent tracker URLs unmodified.
+    """
+    aliases = cfg.get('TRACKER_HOST_ALIASES', {}) if isinstance(cfg, dict) else {}
+    aliases = aliases if isinstance(aliases, dict) else {}
+    resolved = []
+    for host in hosts:
+        current = str(host or 'Unknown').strip().lower() or 'Unknown'
+        # Resolve a short chain and fail closed on a malformed loop.
+        seen = set()
+        while current in aliases and current not in seen:
+            seen.add(current)
+            target = aliases[current]
+            if not isinstance(target, str) or not target.strip():
+                break
+            current = target.strip().lower()
+        if current not in resolved:
+            resolved.append(current)
+    return resolved or ['Unknown']
+
+
 # Substrings (lowercased) of tracker status messages that mean the torrent is
 # no longer registered on the tracker — trumped, deleted, or nuked. Seeding
 # such a torrent earns nothing; it is the strongest "dead weight" signal the

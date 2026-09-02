@@ -67,6 +67,7 @@ const NAV = [
       { id: 'backfill', label: 'Backfill', accent: 'var(--blue)' },
       { id: 'cleanup',  label: 'Cleanup',  accent: 'var(--yellow)', badgeKey: 'cleanup' },
       { id: 'triage',   label: 'Triage',   accent: 'var(--red)',    badgeKey: 'triage' },
+      { id: 'decommission', label: 'Decommission', accent: 'var(--red)' },
       { id: 'dedupe',   label: 'Dedupe',   accent: 'var(--purple)', badgeKey: 'dedupe' },
       { id: 'trumped',  label: 'Trumped',  accent: 'var(--green)' },
     ],
@@ -106,7 +107,7 @@ const NAV = [
   },
 ]
 
-const WORKFLOW_TAB_IDS = ['backfill', 'triage', 'cleanup', 'dedupe', 'trumped']
+const WORKFLOW_TAB_IDS = ['backfill', 'triage', 'decommission', 'cleanup', 'dedupe', 'trumped']
 
 export default function Sidebar({ active, onChange, isScanning, progress, lastAuditTime, lastScanStatus, trigger, nextScanIn, statusMessage, score, crossSeedMultiplier, activeImportCount, onOpenImportPanel, workflowCounts }) {
   const scoreC = score != null ? scoreColor(score) : 'var(--text-dim)'

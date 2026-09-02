@@ -23,33 +23,38 @@ function StatBox({ label, value, sub, color }) {
 
 function DupGroup({ group, checked, onToggle }) {
   const canonical  = group.files.find(f => f.canonical)
-  const duplicates = group.files.filter(f => !f.canonical)
   const filename   = (canonical?.path || '').replace(/\\/g, '/').split('/').pop()
+  const actionable = group.status === 'reclaimable_now'
+  const state = actionable
+    ? { label: 'reclaimable now', color: 'var(--green)', title: 'Same physical filesystem; exact comparison is still required before linking.' }
+    : group.status === 'cross_device'
+      ? { label: 'cross-device', color: 'var(--yellow)', title: 'These copies are on different backing filesystems. They cannot be hardlinked in place.' }
+      : { label: 'blocked', color: 'var(--red)', title: group.blocker || 'Physical backing location could not be verified safely.' }
 
   return (
     <div
-      onClick={() => !group.cross_fs && onToggle()}
+      onClick={() => actionable && onToggle()}
       style={{
         background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 9, boxShadow: 'var(--elev-1)',
-        overflow: 'hidden', cursor: group.cross_fs ? 'default' : 'pointer',
-        opacity: group.cross_fs ? 0.6 : 1,
+        overflow: 'hidden', cursor: actionable ? 'pointer' : 'default',
+        opacity: actionable ? 1 : 0.7,
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: checked ? 'var(--accent)06' : 'var(--surface2)' }}>
-        {group.cross_fs ? (
-          <span title="Cannot hardlink across filesystems" style={{ width: 15, flexShrink: 0, textAlign: 'center', fontSize: 11, color: 'var(--text-dim)' }}>—</span>
+        {!actionable ? (
+          <span title={state.title} style={{ width: 15, flexShrink: 0, textAlign: 'center', fontSize: 11, color: state.color }}>—</span>
         ) : (
           <Checkbox checked={checked} onChange={onToggle} />
         )}
         <span title={canonical?.path} style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {filename}
         </span>
-        {group.cross_fs ? (
+        {!actionable ? (
           <span
-            title="These copies live on different filesystems — hardlinks can't span mounts, so this group is skipped"
-            style={{ fontSize: 10, fontFamily: 'var(--mono)', padding: '1px 7px', borderRadius: 99, flexShrink: 0, border: '1px solid var(--border2)', color: 'var(--text-dim)' }}
+            title={state.title}
+            style={{ fontSize: 10, fontFamily: 'var(--mono)', padding: '1px 7px', borderRadius: 99, flexShrink: 0, border: '1px solid var(--border2)', color: state.color }}
           >
-            cross-filesystem
+            {state.label}
           </span>
         ) : (
           <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--green)', flexShrink: 0 }}>
@@ -79,6 +84,11 @@ function DupGroup({ group, checked, onToggle }) {
           </span>
         </div>
       ))}
+      {!actionable && (
+        <div style={{ padding: '7px 14px 8px 36px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--text-dim)' }}>
+          {group.blocker || 'Report-only: no hardlink plan can be generated for this group.'}
+        </div>
+      )}
     </div>
   )
 }
@@ -95,8 +105,8 @@ export default function Dedupe({ onNavigate, onScript }) {
     api.dedupeReport()
       .then(data => {
         setReport(data)
-        // All linkable groups selected by default — dedupe keeps every path alive
-        setSelected(new Set((data.groups || []).filter(g => !g.cross_fs).map(g => g.id)))
+        // Only physically verified same-device groups are selectable.
+        setSelected(new Set((data.groups || []).filter(g => g.status === 'reclaimable_now').map(g => g.id)))
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
@@ -105,10 +115,11 @@ export default function Dedupe({ onNavigate, onScript }) {
   useEffect(() => { load() }, [load])
 
   const groups = report?.groups || []
-  const linkable = useMemo(() => groups.filter(g => !g.cross_fs), [groups])
+  const linkable = useMemo(() => groups.filter(g => g.status === 'reclaimable_now'), [groups])
   const selectedGroups = useMemo(() => linkable.filter(g => selected.has(g.id)), [linkable, selected])
   const selectedRecoverable = selectedGroups.reduce((s, g) => s + g.recoverable_size, 0)
-  const crossFsCount = groups.length - linkable.length
+  const crossDeviceCount = groups.filter(g => g.status === 'cross_device').length
+  const blockedCount = groups.filter(g => g.status === 'blocked').length
 
   const toggle = useCallback(id => {
     setSelected(prev => {
@@ -136,7 +147,7 @@ export default function Dedupe({ onNavigate, onScript }) {
       <WorkflowHeader
         title="Dedupe"
         accent="var(--purple)"
-        blurb="Bit-for-bit identical files that don't share an inode — true copies wasting disk space. The generated script verifies each pair with cmp, then replaces the copy with a hardlink: every path survives and every torrent keeps seeding."
+        blurb="Candidate copies are classified by their physical filesystem. Only same-device candidates can generate a staged hardlink plan; cross-device and unresolved candidates stay report-only. Every generated plan verifies bytes with cmp before linking."
         right={!loading && (
           <button onClick={load} style={{
             fontSize: 12, padding: '6px 16px', borderRadius: 7, cursor: 'pointer',
@@ -159,8 +170,8 @@ export default function Dedupe({ onNavigate, onScript }) {
       {!loading && groups.length > 0 && (
         <>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            <StatBox label="Duplicate Groups" value={groups.length} sub={crossFsCount > 0 ? `${crossFsCount} skipped (cross-filesystem)` : null} />
-            <StatBox label="Recoverable" value={formatBytes(report.total_recoverable)} color="var(--green)" sub="if all groups are hardlinked" />
+            <StatBox label="Duplicate Groups" value={groups.length} sub={crossDeviceCount > 0 || blockedCount > 0 ? `${crossDeviceCount} cross-device · ${blockedCount} blocked` : null} />
+            <StatBox label="Reclaimable Now" value={formatBytes(report.total_recoverable)} color="var(--green)" sub="same filesystem only" />
             {report.excluded_count > 0 && (
               <StatBox label="Excluded" value={report.excluded_count} sub="hidden by your exclusion rules" />
             )}

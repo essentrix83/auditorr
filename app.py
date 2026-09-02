@@ -35,13 +35,14 @@ from db import (
     db_get_latest_upload_snapshot,
     db_save_audit,
     db_get_meta, db_set_meta, db_delete_meta,
+    db_save_decommission_action,
 )
 from state import (
     get_state, set_state, try_start_scanning,
     note_workflow_request_start, note_workflow_request_end, workflow_active,
 )
 from audit import run_audit_process, process_health_metrics, compute_upload_stats, _is_not_imported_torrent, _compute_cross_seed_stats
-from arr import _test_arr_connection, arr_rescan, arr_search, fetch_arr_media_index, test_arr_connections, fetch_arr_indexers, fetch_release_matrix, grab_release, normalize_arr_connections, link_base, poll_queue_until_clear, force_manual_import_by_id, force_import_files, get_arr_file_id, parse_release_info_for_path, fetch_arr_all_titles, title_match_keys, compare_release_quality, parse_trump_pm, match_trump_release, match_trumped_torrent, rank_release_matches, score_release_match, title_soft_match, tracker_matches_indexer
+from arr import _test_arr_connection, arr_rescan, arr_search, fetch_arr_media_index, test_arr_connections, fetch_arr_indexers, fetch_release_matrix, grab_release, normalize_arr_connections, link_base, poll_queue_until_clear, force_manual_import_by_id, force_import_files, get_arr_file_id, parse_release_info_for_path, fetch_arr_all_titles, title_match_keys, compare_release_quality, parse_trump_pm, match_trump_release, match_trumped_torrent, rank_release_matches, score_release_match, title_soft_match, tracker_matches_indexer, get_arr_item, delete_arr_item, set_arr_item_unmonitored, add_arr_import_exclusion
 from scripts import generate_script, _build_dup_groups, dup_group_inputs
 from media_server_exclusions import normalize_disc_rip_presets, normalize_media_server_presets
 from watchdog_handler import restart_watchdog, start_watchdog, _scheduled_audit_loop
@@ -201,6 +202,7 @@ _HEAVY_MEM_PATHS = frozenset({
     '/api/workflows/triage',
     '/api/workflows/cleanup',
     '/api/workflows/dedupe',
+    '/api/workflows/decommission',
     '/api/workflows/acquire_candidates',
     '/api/workflows/generate',
 })
@@ -505,7 +507,10 @@ def clear_history():
 def start_scan():
     if try_start_scanning("manual"):
         threading.Thread(target=run_audit_process, args=("manual",), daemon=True).start()
-    return jsonify({"status": "started"})
+        return jsonify({"status": "started", "scan": get_state()})
+    # A second click must not look like it started a second audit. Return the
+    # active state so clients can attach to its existing progress display.
+    return jsonify({"status": "already_running", "scan": get_state()})
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -560,6 +565,16 @@ def handle_config():
                 'OR_RATIO':           float(data.get('OR_RATIO',  0.01)),
                 'NI_RATIO':           float(data.get('NI_RATIO',  0.01)),
                 'DUP_RATIO':          float(data.get('DUP_RATIO', 0.01)),
+                'TRACKER_HOST_ALIASES': {
+                    str(alias).strip().lower(): str(canonical).strip().lower()
+                    for alias, canonical in data.get(
+                        'TRACKER_HOST_ALIASES', existing.get('TRACKER_HOST_ALIASES', {})
+                    ).items()
+                    if isinstance(alias, str) and isinstance(canonical, str)
+                    and alias.strip() and canonical.strip()
+                } if isinstance(data.get(
+                    'TRACKER_HOST_ALIASES', existing.get('TRACKER_HOST_ALIASES', {})
+                ), dict) else existing.get('TRACKER_HOST_ALIASES', {}),
                 **{k: float(data.get(k, existing.get(k, DEFAULT_CONFIG[k])))
                    for k in SCORE_WEIGHT_KEYS},
                 'EXCLUSION_PATTERNS':           [p for p in data.get('EXCLUSION_PATTERNS', []) if isinstance(p, str)],
@@ -1162,6 +1177,265 @@ def workflows_remove_torrents():
                     "files_deleted": files_deleted, "files_kept": files_kept})
 
 
+def _decommission_error(label, error):
+    """Return a short operator-facing component error without request details."""
+    if isinstance(error, urllib.error.HTTPError):
+        return f'{label} returned HTTP {error.code}'
+    if isinstance(error, urllib.error.URLError):
+        return f'{label} could not be reached'
+    if isinstance(error, (ValueError, sources.SourceConnectionError)):
+        return str(error)
+    log.exception("Decommission %s failed", label, exc_info=error)
+    return f'{label} failed unexpectedly; check the Auditorr log'
+
+
+def _decommission_bool(plan, key, default=False):
+    value = plan.get(key, default)
+    if type(value) is not bool:
+        raise ValueError(f'{key} must be true or false')
+    return value
+
+
+def _arr_item_has_files(service, item):
+    if service == 'radarr':
+        return bool(item.get('hasFile') or item.get('movieFile'))
+    stats = item.get('statistics') or {}
+    return bool((stats.get('episodeFileCount') or 0) > 0)
+
+
+@app.route('/api/workflows/decommission', methods=['POST'])
+@require_auth
+def workflows_decommission():
+    """Run one explicitly confirmed, exact-ID media decommission plan.
+
+    This endpoint is never called by an audit or missing-file detector.  The
+    only UI entry point is an eligible Import Pending row, and the server
+    re-fetches that exact configured Arr connection + item ID before it
+    performs any selected component.
+    """
+    data = request.json or {}
+    if data.get('confirmed') is not True:
+        return jsonify({"status": "error", "message": "Explicit confirmation is required"}), 400
+
+    target = data.get('target') or {}
+    plan = data.get('plan') or {}
+    if not isinstance(target, dict) or not isinstance(plan, dict):
+        return jsonify({"status": "error", "message": "Target and plan must be objects"}), 400
+
+    service = str(target.get('service') or '').lower()
+    connection_id = str(target.get('connection_id') or '').strip()
+    try:
+        arr_id = int(target.get('arr_id'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "A valid Arr item ID is required"}), 400
+    if service not in ('sonarr', 'radarr') or not connection_id:
+        return jsonify({"status": "error", "message": "An exact Sonarr/Radarr connection and item ID are required"}), 400
+
+    arr_action = str(plan.get('arr_action') or '')
+    if arr_action not in ('remove', 'keep_unmonitored'):
+        return jsonify({"status": "error", "message": "Choose whether to remove the Arr item or keep it unmonitored"}), 400
+    torrent_action = str(plan.get('torrent_action', 'keep'))
+    if torrent_action not in ('keep', 'remove_registration', 'remove_auto'):
+        return jsonify({"status": "error", "message": "Invalid torrent action"}), 400
+    try:
+        add_import_exclusion = _decommission_bool(plan, 'add_import_exclusion')
+        delete_arr_files = _decommission_bool(plan, 'delete_arr_files')
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    if arr_action != 'remove' and delete_arr_files:
+        return jsonify({"status": "error", "message": "Arr-side files can only be deleted when removing the Arr item"}), 400
+
+    torrent = target.get('torrent') or {}
+    if torrent_action != 'keep' and (not isinstance(torrent, dict) or not torrent.get('hash')):
+        return jsonify({"status": "error", "message": "A torrent hash is required for torrent removal"}), 400
+
+    cfg = db_load_config()
+    if torrent_action != 'keep' and not cfg.get('ALLOW_CLIENT_DELETE'):
+        return jsonify({
+            "status": "error",
+            "message": "Client deletion is disabled — keep the torrent or enable it in Config → Torrent Source first.",
+        }), 403
+
+    try:
+        conn, live_item = get_arr_item(cfg, service, connection_id, arr_id)
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"The exact Arr target could not be verified: {_decommission_error('Arr', e)}",
+        }), 409 if isinstance(e, ValueError) else 502
+
+    # Reject stale/reused targets and items which are no longer Import Pending.
+    expected_tmdb = target.get('tmdb_id')
+    expected_tvdb = target.get('tvdb_id')
+    expected_title = str(target.get('title') or '')
+    try:
+        tmdb_changed = (expected_tmdb not in (None, '')
+                        and int(expected_tmdb) != int(live_item.get('tmdbId') or 0))
+        tvdb_changed = (expected_tvdb not in (None, '')
+                        and int(expected_tvdb) != int(live_item.get('tvdbId') or 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "The confirmed external media ID is invalid"}), 400
+    if tmdb_changed:
+        return jsonify({"status": "error", "message": "The live Arr item no longer matches the confirmed TMDb identity"}), 409
+    if tvdb_changed:
+        return jsonify({"status": "error", "message": "The live Arr item no longer matches the confirmed TVDb identity"}), 409
+    if expected_title and expected_title != str(live_item.get('title') or ''):
+        return jsonify({"status": "error", "message": "The live Arr item title changed; refresh Triage and confirm it again"}), 409
+    if _arr_item_has_files(service, live_item):
+        return jsonify({
+            "status": "error",
+            "message": "This Arr item now has library files and is no longer eligible for Decommission.",
+        }), 409
+
+    confirmed_plan = {
+        'arr_action': arr_action,
+        'add_import_exclusion': add_import_exclusion,
+        'delete_arr_files': delete_arr_files,
+        'torrent_action': torrent_action,
+        'torrent': {
+            'hash': str(torrent.get('hash') or ''),
+            'instance_id': torrent.get('instance_id'),
+        } if isinstance(torrent, dict) else {'hash': '', 'instance_id': None},
+    }
+    result = {
+        'arr_exclusion': {'selected': add_import_exclusion, 'status': 'skipped', 'message': 'Not selected'},
+        'arr_action': {'selected': True, 'status': 'pending', 'message': ''},
+        'torrent': {'selected': torrent_action != 'keep', 'status': 'kept', 'message': 'Torrent kept seeding'},
+    }
+    arr_or_torrent_mutated = False
+
+    if add_import_exclusion:
+        try:
+            add_arr_import_exclusion(conn, service, live_item)
+            result['arr_exclusion'] = {'selected': True, 'status': 'success', 'message': 'Import-list exclusion added'}
+            arr_or_torrent_mutated = True
+        except Exception as e:
+            result['arr_exclusion'] = {'selected': True, 'status': 'failed', 'message': _decommission_error('Arr exclusion', e)}
+
+    try:
+        if arr_action == 'remove':
+            delete_arr_item(conn, service, live_item, delete_files=delete_arr_files)
+            msg = 'Removed from Arr'
+            if delete_arr_files:
+                msg += ' with remaining Arr-side files'
+            result['arr_action'] = {'selected': True, 'status': 'success', 'message': msg}
+            arr_or_torrent_mutated = True
+        elif live_item.get('monitored') is False:
+            result['arr_action'] = {'selected': True, 'status': 'success', 'message': 'Already unmonitored in Arr'}
+        else:
+            set_arr_item_unmonitored(conn, service, live_item)
+            result['arr_action'] = {'selected': True, 'status': 'success', 'message': 'Kept in Arr and set unmonitored'}
+            arr_or_torrent_mutated = True
+    except Exception as e:
+        result['arr_action'] = {'selected': True, 'status': 'failed', 'message': _decommission_error('Arr action', e)}
+
+    if torrent_action != 'keep':
+        items = [{'hash': str(torrent['hash']), 'instance_id': torrent.get('instance_id')}]
+        try:
+            if torrent_action == 'remove_auto':
+                delete_items, keep_items = _partition_removal_by_file_sharing(cfg, items)
+                removed = sources.remove_torrents(cfg, delete_items, delete_files=True) if delete_items else 0
+                removed += sources.remove_torrents(cfg, keep_items, delete_files=False) if keep_items else 0
+                files_deleted, files_kept = len(delete_items), len(keep_items)
+            else:
+                removed = sources.remove_torrents(cfg, items, delete_files=False)
+                files_deleted, files_kept = 0, removed
+            result['torrent'] = {
+                'selected': True, 'status': 'success',
+                'message': f'Removed {removed} torrent registration(s)',
+                'removed': removed, 'files_deleted': files_deleted, 'files_kept': files_kept,
+            }
+            if removed:
+                arr_or_torrent_mutated = True
+        except Exception as e:
+            result['torrent'] = {'selected': True, 'status': 'failed', 'message': _decommission_error('Torrent removal', e)}
+
+    rescan_started = False
+    if arr_or_torrent_mutated and try_start_scanning('decommission'):
+        threading.Thread(target=run_audit_process, args=('decommission',), daemon=True).start()
+        rescan_started = True
+
+    failed = [name for name, component in result.items()
+              if component.get('selected') and component.get('status') == 'failed']
+    action_record = {
+        'target': {'service': service, 'connection_id': connection_id, 'arr_id': arr_id},
+        'confirmed_plan': confirmed_plan,
+        'live_arr_payload': live_item,
+        'result': {
+            'status': 'partial' if failed else 'success',
+            'components': result,
+            'failed_components': failed,
+            'audit_started': rescan_started,
+            'arr_or_torrent_mutated': arr_or_torrent_mutated,
+        },
+    }
+    try:
+        db_save_decommission_action(action_record)
+    except Exception:
+        log.exception('Could not save the Decommission action record')
+        response_components = dict(result)
+        response_components['action_record'] = {
+            'selected': True, 'status': 'failed',
+            'message': 'Auditorr could not save the append-only action record; check the log immediately.',
+        }
+        return jsonify({
+            'status': 'partial',
+            'message': 'The plan ran, but Auditorr could not save its action record. Check the log immediately.',
+            'components': response_components,
+            'failed_components': failed + ['action_record'],
+            'audit_started': rescan_started,
+        }), 207
+
+    status = 'partial' if failed else 'success'
+    code = 207 if failed else 200
+    return jsonify({
+        'status': status,
+        'message': ('Some decommission components failed' if failed
+                    else 'Decommission plan completed'),
+        'components': result,
+        'failed_components': failed,
+        'audit_started': rescan_started,
+    }), code
+
+
+def _is_decommission_candidate(item):
+    """Return True only for an exact-ID, missing-library Arr candidate."""
+    if not isinstance(item, dict) or item.get('verdict') != 'import_pending':
+        return False
+    library = item.get('library')
+    if not isinstance(library, dict):
+        return False
+    return (library.get('service') in ('sonarr', 'radarr')
+            and bool(library.get('connection_id'))
+            and library.get('arr_id') is not None)
+
+
+@app.route('/api/workflows/decommission', methods=['GET'])
+@require_auth
+def workflows_decommission_report():
+    """List explicit Decommission candidates without mutating anything.
+
+    The queue deliberately reuses Triage's conservative Import Pending
+    classification, then applies the stricter exact Arr identity requirement.
+    A missing file never invokes the POST workflow automatically.
+    """
+    triage_response = workflows_triage()
+    triage_report = triage_response.get_json() or {}
+    items = [item for item in (triage_report.get('items') or [])
+             if _is_decommission_candidate(item)]
+    cfg = db_load_config()
+    source = cfg.get('TORRENT_SOURCE', 'qbittorrent')
+    return jsonify({
+        'status': 'success',
+        'items': items,
+        'count': len(items),
+        'truncated': bool(triage_report.get('truncated')),
+        'client_name': 'qui' if source == 'qui' else 'qBittorrent',
+        'client_delete_allowed': bool(cfg.get('ALLOW_CLIENT_DELETE', False)),
+    })
+
+
+
 @app.route('/api/workflows/force_import', methods=['POST'])
 @require_auth
 def workflows_force_import():
@@ -1662,11 +1936,15 @@ def workflows_triage():
     """Classify every problem torrent into an actionable verdict (phase 1).
 
     Covers two candidate sets: not-imported torrents, and imported torrents
-    whose audit-time tracker check flagged the torrent as unregistered.
+    whose audit-time tracker check is either unregistered or not definitively
+    working. Uncertain imported torrents are held until live verification.
 
     Verdicts (priority order):
-      dead_seed       — imported AND tracker-dead: deleting via the client is
-                        lossless (the library hardlink keeps the data)
+      dead_seed       — imported AND live tracker health is unregistered:
+                        deleting via the client is lossless (the library
+                        hardlink keeps the data)
+      tracker_unverified — imported but tracker health is not definitive;
+                           held and not deletion-eligible
       unregistered    — not imported, tracker no longer registers the torrent
       superseded      — the library already has this title (possibly different quality)
       import_pending  — title is managed by Sonarr/Radarr but has no library file
@@ -1695,6 +1973,10 @@ def workflows_triage():
                   if f.get('imported') and not f.get('excluded')
                   and f.get('status') != 'Orphaned'
                   and f.get('tracker_health') == 'unregistered']
+    held_imported = [f for f in torrent_files
+                     if f.get('imported') and not f.get('excluded')
+                     and f.get('status') != 'Orphaned'
+                     and f.get('tracker_health') not in ('working', 'unregistered')]
 
     # Group files by torrent hash — verdicts are per torrent, not per file
     groups = {}
@@ -1727,6 +2009,24 @@ def workflows_triage():
             'trackers':      set(),
             'imported':      True,
             'stored_health': 'unregistered',   # the dead_seeds filter above
+            'stored_msg':    f.get('tracker_msg') or '',
+        })
+        g['files'].append(f)
+        g['total_size'] += f['size']
+        g['trackers'].update(t for t in (f.get('trackers') or []) if t != 'None')
+    for f in held_imported:
+        key = f.get('hash') or f['path']
+        existing = groups.get(key)
+        if existing is not None and not existing['imported']:
+            continue
+        g = groups.setdefault(key, {
+            'hash':          f.get('hash') or '',
+            'instance_id':   f.get('instance_id'),
+            'files':         [],
+            'total_size':    0,
+            'trackers':      set(),
+            'imported':      True,
+            'stored_health': f.get('tracker_health') or 'unknown',
             'stored_msg':    f.get('tracker_msg') or '',
         })
         g['files'].append(f)
@@ -1832,7 +2132,7 @@ def workflows_triage():
         if g['imported']:
             # 'working' → None: a torrent the tracker answers for again has
             # recovered (re-registered) — the row disappears on live verify.
-            alternatives = {'working': None, 'unregistered': 'dead_seed', 'other': 'dead_seed'}
+            alternatives = {'working': None, 'unregistered': 'dead_seed', 'other': 'tracker_unverified'}
         else:
             alternatives = {'working': fallback, 'unregistered': 'unregistered', 'other': fallback}
 
@@ -1870,6 +2170,8 @@ def workflows_triage():
                 'quality_cmp':  'unknown',
                 'arr_id':        t.get('arr_id'),
                 'connection_id': t.get('connection_id'),
+                'tmdb_id':       t.get('tmdb_id'),
+                'tvdb_id':       t.get('tvdb_id'),
             }
 
         # A byte-identical copy of this torrent's data already exists on disk
@@ -1960,8 +2262,8 @@ def workflows_triage():
             'alive_sibling':  g['alive_sibling'],
         })
 
-    verdict_order = {'dead_seed': 0, 'dead_registration': 1, 'unregistered': 2,
-                     'superseded': 3, 'import_pending': 4, 'not_in_library': 5}
+    verdict_order = {'dead_seed': 0, 'dead_registration': 1, 'tracker_unverified': 2,
+                     'unregistered': 3, 'superseded': 4, 'import_pending': 5, 'not_in_library': 6}
     items.sort(key=lambda i: (verdict_order.get(i['verdict'], 9), -i['total_size']))
     counts = {}
     for i in items:
@@ -2146,9 +2448,12 @@ def workflows_dedupe():
             'id':               canonical['path'],
             'files':            g['files'],
             'recoverable_size': g['recoverable_size'],
-            'cross_fs':         g['skipped'],
+            'status':           g.get('status', 'blocked' if g['skipped'] else 'reclaimable_now'),
+            'blocker':          g.get('blocker', ''),
+            'cross_fs':         g.get('status') == 'cross_device' or (g['skipped'] and g.get('status') != 'blocked'),
         })
-    groups_out.sort(key=lambda g: (g['cross_fs'], -g['recoverable_size']))
+    order = {'reclaimable_now': 0, 'cross_device': 1, 'blocked': 2}
+    groups_out.sort(key=lambda g: (order.get(g['status'], 9), -g['recoverable_size']))
 
     return jsonify({
         "status":            "success",

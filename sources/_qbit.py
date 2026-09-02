@@ -15,7 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import qbittorrentapi
 
-from sources import SourceConnectionError, classify_tracker_entries, HEALTH_RANK as _HEALTH_RANK
+from sources import (SourceConnectionError, canonical_tracker_hosts,
+                     classify_tracker_entries, HEALTH_RANK as _HEALTH_RANK)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,7 @@ def _fetch_inner(cfg):
             raw   = [e['url'] for e in entries
                      if e['url'].startswith('http') or e['url'].startswith('udp')]
             hosts = [u.split('/')[2] for u in raw if len(u.split('/')) > 2] or ['Unknown']
+            hosts = canonical_tracker_hosts(cfg, hosts)
             health, msg = classify_tracker_entries(entries)
             files = list(thread_qbt.torrents_files(torrent_hash=torrent.hash))
         except Exception:

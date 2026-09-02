@@ -905,7 +905,7 @@ function TrackerDetailModal({ trackerName, trackerStats, uploadStats, onNavigate
 }
 
 // ── Main Dashboard ────────────────────────────────────────────────────────────
-export default function Dashboard({ data, changes, onNavigate, isRefreshing, onScript, timeRange, setTimeRange, selectedTrackers, setSelectedTrackers, allTrackers, onReveal }) {
+export default function Dashboard({ data, changes, onNavigate, isRefreshing, onScript, onScan, scanState, timeRange, setTimeRange, selectedTrackers, setSelectedTrackers, allTrackers, onReveal }) {
   const toast = useToast()
   const [uploadStats, setUploadStats] = useState(null)
   const [trackerDetail, setTrackerDetail] = useState(null)
@@ -927,6 +927,10 @@ export default function Dashboard({ data, changes, onNavigate, isRefreshing, onS
   const hlPct = det.total_media_size > 0
     ? Math.round((det.hardlinked_media_size / det.total_media_size) * 100) : 100
   const c = scoreColor(score)
+  const auditRunning = !!scanState?.is_scanning
+  const auditLabel = auditRunning
+    ? `Audit running${scanState?.status_message ? ` — ${scanState.status_message}` : ''}`
+    : `Snapshot from ${scanState?.last_audit_time || 'Never'}`
 
   // Per-day series from upload snapshots — feeds the card trend pills.
   // Orphaned/Not Imported sum the per-tracker stats; Hardlinked %/Duplicates
@@ -1095,7 +1099,22 @@ export default function Dashboard({ data, changes, onNavigate, isRefreshing, onS
           panels below and matching the Trackers page's layout. */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <RangePresets isActive={v => timeRange === v} onSelect={setTimeRange} />
-        <TrackerDropdown selectedTrackers={selectedTrackers} allTrackers={allTrackers} onTrackersChange={setSelectedTrackers} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: auditRunning ? 'var(--yellow)' : 'var(--text-dim)' }} title="Dashboard values update after an audit completes.">
+            {auditLabel}
+          </span>
+          {onScan && (
+            <button
+              onClick={onScan}
+              disabled={auditRunning}
+              title={auditRunning ? 'An audit is already running' : 'Run a fresh library audit'}
+              style={{ padding: '5px 12px', borderRadius: 7, border: '1px solid var(--border2)', background: auditRunning ? 'transparent' : 'var(--accent)', color: auditRunning ? 'var(--text-dim)' : '#000', fontSize: 11, fontWeight: 700, cursor: auditRunning ? 'default' : 'pointer', opacity: auditRunning ? 0.7 : 1 }}
+            >
+              {auditRunning ? 'Audit running…' : '▶ Run Audit'}
+            </button>
+          )}
+          <TrackerDropdown selectedTrackers={selectedTrackers} allTrackers={allTrackers} onTrackersChange={setSelectedTrackers} />
+        </div>
       </div>
 
       {/* Changes since last scan */}

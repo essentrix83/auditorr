@@ -9,6 +9,7 @@ import Config       from './components/Config'
 import Trackers     from './components/Trackers'
 import Backfill     from './components/workflows/Backfill'
 import Triage       from './components/workflows/Triage'
+import Decommission from './components/workflows/Decommission'
 import Cleanup      from './components/workflows/Cleanup'
 import Dedupe       from './components/workflows/Dedupe'
 import Trumped      from './components/workflows/Trumped'
@@ -127,7 +128,7 @@ function ScriptModal({ scriptType, title, subtitle, body, onClose }) {
 function getHashTab() {
   let hash = window.location.hash.replace('#', '') || 'dashboard'
   if (hash === 'workflows') hash = 'backfill'  // legacy alias from before per-workflow pages
-  const valid = ['dashboard', 'next-steps', 'media', 'torrents', 'trackers', 'changes', 'config', 'backfill', 'triage', 'cleanup', 'dedupe', 'trumped']
+  const valid = ['dashboard', 'next-steps', 'media', 'torrents', 'trackers', 'changes', 'config', 'backfill', 'triage', 'decommission', 'cleanup', 'dedupe', 'trumped']
   return valid.includes(hash) ? hash : 'dashboard'
 }
 function setHashTab(tab) {
@@ -449,6 +450,8 @@ function AppInner() {
               onNavigate={handleNavigate}
               isRefreshing={isRefreshing}
               onScript={setScriptModal}
+              onScan={handleScan}
+              scanState={scanState}
               timeRange={timeRange}
               setTimeRange={setTimeRange}
               selectedTrackers={selectedTrackers}
@@ -500,6 +503,9 @@ function AppInner() {
           {tab === 'triage' && (
             <Triage onNavigate={handleNavigate}
               cleanupCount={results?.dashboard?.current?.details?.orphaned_torrent_count || 0} />
+          )}
+          {tab === 'decommission' && (
+            <Decommission onNavigate={handleNavigate} />
           )}
           {tab === 'cleanup' && (
             <Cleanup onNavigate={handleNavigate} onScript={setScriptModal}
