@@ -2,8 +2,9 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main, experimental ]
-    tags: [ 'v*' ]
+    branches: [ essentrix83 ]
+    tags: [ 'v*', '*-essentrix.*' ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -35,12 +36,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/thrill-burn/auditorr
+          images: ghcr.io/essentrix83/auditorr
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=tag
+            type=raw,value=1.7.2-essentrix.1,enable=${{ github.ref == 'refs/heads/essentrix83' }}
+            type=sha,prefix={{branch}}-
 
       - name: Build and push
         uses: docker/build-push-action@v5
